@@ -93,7 +93,7 @@ python -m venv .venv
 
 Датированные поступления после горизонта не уменьшают заказ. Неизвестные даты прихода, начальный или неподтверждённый месячный остаток и устаревший снимок требуют ручной проверки. Дополнительно проверяется разрыв запаса до позднего поступления: общая сумма товара в пути не должна скрывать дефицит до его прихода. Приоритет отражает риск дефицита за срок поставки. В каждой строке сохраняется объяснение входных чисел и поправок.
 
-## Architecture
+## Архитектура
 
 ```mermaid
 flowchart LR
@@ -168,15 +168,3 @@ ACCEPTANCE.md      Соответствие ТЗ и границы реализ�
 Владелец кейса: **Электрокомплект**. 
 
 Подробная проверка требований: [ACCEPTANCE.md](ACCEPTANCE.md).
-
-## Roadmap for the pilot
-
-- [x] Connect the two suppliers' Excel formats and supplier grouping.
-- [x] Implement seasonality, trend, sparse demand, spike handling, MOQ and packaging.
-- [x] Add explanations, manual corrections, selected approval and CSV export.
-- [x] Compare forecasts with baselines using time-based validation.
-- [x] Add optional AI tool calling and a synthetic offline demo.
-- [ ] Validate current free stock, arrival dates and warehouse scope with the case owner.
-- [ ] Select forecasting methods on earlier validation windows and test on a new holdout period.
-- [ ] Agree the import format for the company's 1C configuration.
-- [ ] Measure procurement time, stockouts and inventory costs in a supervised pilot.
