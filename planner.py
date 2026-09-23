@@ -90,6 +90,71 @@ def _monthly_outliers(values: np.ndarray, pattern: str) -> tuple[np.ndarray, flo
     return flags, float(np.median(remaining)) if len(remaining) else 0.
 
 
+def _regular_level_growth(levels: np.ndarray, times: np.ndarray) -> tuple[float, float]:
+    """Existing robust regular-demand estimate, shared with the past-only selector."""
+    levels, times = levels[-12:], times[-12:]
+    slopes = []
+    if len(levels) >= 6:
+        slopes = [(levels[j] - levels[i]) / (times[j] - times[i])
+                  for i in range(len(times)) for j in range(i + 1, len(times))]
+    slope = float(np.median(slopes)) if slopes else 0.
+    raw_level = float(np.median(levels[-6:]))
+    growth = float(np.clip(12 * slope / max(raw_level, 1), -.5, .5))
+    bounded_slope = growth * raw_level / 12
+    level = max(0., float(np.median(levels[-6:] + bounded_slope * (times[-1] - times[-6:]))))
+    return level, growth
+
+
+def _regular_method_choice(monthly: pd.DataFrame) -> tuple[bool, int, float, float]:
+    """Choose a three-month mean only with clear evidence from three past folds.
+
+    Each target is predicted from months strictly before it. We use raw monthly
+    sales for the target, and recompute spike cleaning on each training prefix.
+    Both candidates see the same seasonal factors and observations. Anomalous
+    or stockout-proxy targets, and missing calendar months, cannot decide the
+    method. These are selection diagnostics, not an independent accuracy claim.
+    """
+    if len(monthly) < 12:
+        return False, 0, float("nan"), float("nan")
+    qty = monthly.qty.to_numpy(dtype=float)
+    factor = monthly.season_factor.to_numpy(dtype=float)
+    months = list(monthly.month)
+    times = (monthly.month.dt.year * 12 + monthly.month.dt.month).to_numpy(dtype=float)
+    errors_robust, errors_mean = [], []
+    mean_wins = 0
+    for target in range(len(monthly) - 3, len(monthly)):
+        # The baseline really needs three consecutive preceding calendar
+        # months; missing observations are never treated as zero.
+        if any(months[j] != months[j - 1] + pd.DateOffset(months=1)
+               for j in range(target - 2, target + 1)):
+            continue
+        if bool(monthly.iloc[target].stockout_proxy):
+            continue
+        target_deseasoned = np.concatenate((qty[:target], qty[target:target + 1])) / factor[:target + 1]
+        if _outliers(target_deseasoned)[-1]:
+            continue
+        prefix = (qty[:target] / factor[:target]).copy()
+        flags, replacement = _monthly_outliers(prefix, "regular")
+        prefix[flags] = replacement
+        robust_level, robust_growth = _regular_level_growth(prefix, times[:target])
+        months_ahead = max((times[target] - times[target - 1]) / 12, 0.)
+        forecast_robust = robust_level * factor[target] * (1 + robust_growth) ** months_ahead
+        forecast_mean = float(np.mean(prefix[-3:])) * factor[target]
+        robust_error = abs(forecast_robust - qty[target])
+        mean_error = abs(forecast_mean - qty[target])
+        errors_robust.append(robust_error)
+        errors_mean.append(mean_error)
+        mean_wins += mean_error + 1e-8 < robust_error
+    folds = len(errors_robust)
+    if folds < 3:
+        return False, folds, float("nan"), float("nan")
+    mae_robust, mae_mean = float(np.mean(errors_robust)), float(np.mean(errors_mean))
+    # Three folds are noisy: require at least 25% lower MAE, at least one unit
+    # per month, and a win in two of the three months.
+    choose_mean = bool(mean_wins >= 2 and mae_mean + 1. <= .75 * mae_robust)
+    return choose_mean, folds, mae_robust, mae_mean
+
+
 def _round_order(need: float, moq: int, pack: int) -> int:
     return 0 if need <= 1e-8 else int(math.ceil((max(need, moq) - 1e-9) / pack) * pack)
 
@@ -231,6 +296,7 @@ def calculate_orders(
     for product in products.itertuples(index=False):
         key = (product.supplier, product.sku)
         reasons, review = [], False
+        chosen_mean = False
         factors = {month: season_lookup.get((product.supplier, product.category, month), season_lookup.get((product.supplier, "Все", month), 1.)) for month in range(1, 13)}
         if not any((product.supplier, cat, m) in season_lookup for cat in [product.category, "Все"] for m in range(1, 13)):
             missing_season = True
@@ -290,15 +356,22 @@ def calculate_orders(
             levels = (recent.adjusted_qty / recent.season_factor).to_numpy(dtype=float)
             times = (recent.month.dt.year * 12 + recent.month.dt.month).to_numpy(dtype=float)
             if pattern == "regular":
-                slopes = []
-                if len(recent) >= 6:
-                    slopes = [(levels[j] - levels[i]) / (times[j] - times[i]) for i in range(len(times)) for j in range(i + 1, len(times))]
-                slope = float(np.median(slopes)) if slopes else 0.
-                raw_level = float(np.median(levels[-6:]))
-                local_growth = float(np.clip(12 * slope / max(raw_level, 1), -.5, .5))
-                bounded_slope = local_growth * raw_level / 12
-                monthly_demand = max(0., float(np.median(levels[-6:] + bounded_slope * (times[-1] - times[-6:]))))
-                model_label = "Робастный уровень и тренд"
+                monthly_demand, local_growth = _regular_level_growth(levels, times)
+                chosen_mean, folds, robust_mae, mean_mae = _regular_method_choice(monthly)
+                if chosen_mean:
+                    monthly_demand = max(0., float(np.mean(levels[-3:])))
+                    local_growth = 0.
+                    model_label = "Среднее 3 месяцев с сезонностью"
+                else:
+                    model_label = "Робастный уровень и тренд"
+                if folds == 3:
+                    reasons.append(
+                        f"Выбор прогноза по 3 прошлым месяцам: средняя ошибка робастного метода "
+                        f"{robust_mae:.1f}, среднего за 3 месяца {mean_mae:.1f} ед./месяц; "
+                        f"выбрано «{model_label}». Это внутренняя проверка, не независимая оценка точности"
+                    )
+                elif len(monthly) >= 12:
+                    reasons.append("Для выбора метода недостаточно сопоставимых прошлых месяцев; сохранён робастный прогноз")
             else:
                 # Expected units/month = average positive size × observed event
                 # frequency. Unlike the median, this preserves recurring rare
@@ -329,7 +402,14 @@ def calculate_orders(
             for hist in monthly.itertuples():
                 history.append(dict(supplier=product.supplier, sku=product.sku, month=hist.month, qty=hist.qty, clean_qty=hist.clean_qty, adjusted_qty=hist.adjusted_qty, season_factor=hist.season_factor, spike=bool(hist.spike), client_spike=bool(hist.client_spike), transaction_spike=bool(hist.transaction_spike), stockout_proxy=bool(hist.stockout_proxy), lost_demand=hist.lost_demand))
         source_growth = growth_lookup.get((product.supplier, product.category), growth_lookup.get((product.supplier, "Все")))
-        estimated_growth = local_growth if source_growth is None else .6 * local_growth + .4 * float(np.clip(source_growth, -.8, 1))
+        # The selected mean is a simple seasonal baseline. Do not silently add
+        # the SKU/category trend back to it; the manager's explicit adjustment
+        # below still applies in both methods.
+        estimated_growth = (
+            0. if chosen_mean else
+            local_growth if source_growth is None else
+            .6 * local_growth + .4 * float(np.clip(source_growth, -.8, 1))
+        )
         final_growth = float(np.clip(estimated_growth + float(growth_pct) / 100, -.8, 1.))
         anchor = monthly.month.max() + pd.Timedelta(days=DAYS_PER_MONTH / 2) if not monthly.empty else today
         future_factors = np.array([factors[date.month] for date in dates])
