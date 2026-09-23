@@ -8,3 +8,5 @@
 **Prompt of track/topic (on English):** The purchasing manager calculates inventory replenishment using Excel, resulting in infrequent orders, while one-off large sales distort the data on regular demand. The service analyzes sales history, stock levels, and goods in transit to suggest orders to suppliers while excluding one-time spikes from the calculations. 
 
 Владелец задачи: Электрокомплект
+
+**Progress**: 10%
