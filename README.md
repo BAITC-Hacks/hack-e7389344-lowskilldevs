@@ -5,13 +5,33 @@
 
 The project is being developed for the Elektrocomplekt LLC (ekt.kz) case at HackAlem AI
 
-Менеджер закупок загружает отчёты ИЭК и Systeme Electric, получает предложения по пополнению склада с объяснением по каждому артикулу, корректирует количества и утверждает выгрузку. Приложение учитывает сезонность, динамику продаж, остатки, товары в пути, минимальную партию и кратность. Разовые всплески обрабатываются отдельно от регулярного спроса.
+## Problem
 
-Рабочий статистический MVP на Python и Streamlit. Для запуска не нужны API-ключи. Исходные данные не передаются внешним AI-сервисам.
+Warehouse replenishment is currently calculated manually by consolidating data in Excel. Because detailed analysis is time-consuming, purchase orders are generated infrequently rather than in near real time. This creates two major problems:
 
-## Быстрый запуск
+- excess inventory and unnecessary storage costs;
+- stock shortages and lost sales.
 
-Нужен Python 3.11–3.13; рекомендуем 3.12.
+One-time bulk purchases, including unusually large purchases by a single customer, can also inflate estimates of recurring demand.
+
+## Solution
+
+The service analyzes each SKU (storage keeping unit) and generates a recommended supplier order with an explanation of the result. A procurement manager reviews and may adjust the recommendations before approving an order.
+
+The primary workflow is:
+
+1. The manager uploads data or starts a calculation for a warehouse or product category.
+2. The service validates the data and identifies anomalous one-time sales.
+3. The forecasting component estimates recurring demand using seasonality, trends, and stockout information.
+4. The service calculates the required quantity using current inventory and incoming stock.
+5. Recommendations are grouped by supplier and made available for review and export.
+6. An authorized employee reviews and approves the order.
+
+Functional static MVP built with Python and Streamlit. No API keys are required to run it. Source data is not transmitted to AI services.
+
+## Quick Start
+
+Python 3.11–3.13 are required; Python 3.12 are recommended.
 
 ```powershell
 git clone https://github.com/BAITC-Hacks/hack-e7389344-lowskilldevs.git
@@ -114,40 +134,11 @@ tests/             Автоматические проверки
 ACCEPTANCE.md      Соответствие ТЗ и границы реализации
 ```
 
-## Демонстрация за три минуты
-
-1. Откройте приложение: сразу видны предложения по двум поставщикам.
-2. Выберите DEMO-002: покажите крупную продажу июня и очищенную историю.
-3. Выберите DEMO-003: покажите поправку на возможные недопродажи.
-4. Увеличьте срок поставки: пересчитываются потребность и количество заказа.
-5. Измените количество, подтвердите заказ и скачайте CSV. Объясните, что менеджер сохраняет контроль над заказом.
-
-Команда: **LowSkillDevs**. Владелец кейса: **Электрокомплект**. Подробная проверка требований: [ACCEPTANCE.md](ACCEPTANCE.md).
+Development team: **LowSkillDevs**
+Challenge owner: **Электрокомплект**
+Detailed verification of requirements: [ACCEPTANCE.md](ACCEPTANCE.md).
 
 
-
-
-## Problem
-
-Warehouse replenishment is currently calculated manually by consolidating data in Excel. Because detailed analysis is time-consuming, purchase orders are generated infrequently rather than in near real time. This creates two major problems:
-
-- excess inventory and unnecessary storage costs;
-- stock shortages and lost sales.
-
-One-time bulk purchases, including unusually large purchases by a single customer, can also inflate estimates of recurring demand.
-
-## Solution
-
-The service analyzes each SKU (storage keeping unit) and generates a recommended supplier order with an explanation of the result. A procurement manager reviews and may adjust the recommendations before approving an order.
-
-The primary workflow is:
-
-1. The manager uploads data or starts a calculation for a warehouse or product category.
-2. The service validates the data and identifies anomalous one-time sales.
-3. The forecasting component estimates recurring demand using seasonality, trends, and stockout information.
-4. The service calculates the required quantity using current inventory and incoming stock.
-5. Recommendations are grouped by supplier and made available for review and export.
-6. An authorized employee reviews and approves the order.
 
 ## Key Features
 
