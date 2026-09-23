@@ -12,7 +12,7 @@ class ReplenishmentTests(unittest.TestCase):
         months = pd.date_range(end="2026-08-01", periods=len(quantities), freq="MS")
         return {
             "sales": pd.DataFrame([dict(supplier="S", sku="A", name="Товар", category="C", month=m, qty=q) for m, q in zip(months, quantities)]),
-            "stock": pd.DataFrame([dict(supplier="S", sku="A", month=pd.Timestamp("2026-09-01"), stock=0.)]),
+            "stock": pd.DataFrame([dict(supplier="S", sku="A", month=pd.Timestamp("2026-09-01"), stock=0., stock_basis="snapshot")]),
             "moq": pd.DataFrame([dict(supplier="S", sku="A", moq=1, pack_size=1)]),
             "transit": pd.DataFrame(columns=["supplier", "sku", "qty", "eta"]),
             "seasonality": pd.DataFrame([dict(supplier="S", category="C", month=m, factor=1.) for m in range(1, 13)]),
@@ -40,6 +40,63 @@ class ReplenishmentTests(unittest.TestCase):
         self.assertEqual(result["orders"].iloc[0].monthly_demand, 30)
         self.assertEqual(result["history"].iloc[-1].clean_qty, 30)
 
+    def test_recurring_quarterly_sales_remain_positive_demand(self):
+        result = self.calculate(self.data([0., 0., 10.] * 4))
+        row = result["orders"].iloc[0]
+        self.assertEqual(row.demand_pattern, "intermittent")
+        self.assertAlmostEqual(row.monthly_demand, 10 / 3, places=3)
+        self.assertEqual(row.spikes_removed, 0)
+        self.assertEqual(result["history"].clean_qty.sum(), 40)
+        self.assertGreater(row.order_qty, 0)
+        self.assertFalse(row.manual_review)
+
+    def test_intermittent_huge_event_preserves_normal_positive_sizes(self):
+        data = self.data([0., 0., 10.] * 3 + [0., 0., 1000.])
+        result = self.calculate(data)
+        row = result["orders"].iloc[0]
+        self.assertEqual(row.spikes_removed, 1)
+        self.assertAlmostEqual(row.monthly_demand, 10 / 3, places=3)
+        self.assertEqual(result["history"].iloc[-1].qty, 1000)
+        self.assertEqual(result["history"].iloc[-1].clean_qty, 10)
+
+    def test_isolated_event_retained_and_requires_manager(self):
+        result = self.calculate(self.data([0.] * 11 + [1000.]))
+        row = result["orders"].iloc[0]
+        self.assertEqual(row.demand_pattern, "insufficient")
+        self.assertTrue(row.manual_review)
+        self.assertTrue(pd.isna(row.order_qty))
+        self.assertEqual(result["history"].iloc[-1].clean_qty, 1000)
+        self.assertEqual(row.spikes_removed, 0)
+        self.assertIn("регулярность не подтверждена", row.reason)
+
+    def test_all_zero_demand_is_not_a_positive_order(self):
+        row = self.row(self.data([0.] * 12))
+        self.assertEqual(row.demand_pattern, "no_demand")
+        self.assertEqual(row.monthly_demand, 0)
+        self.assertEqual(row.order_qty, 0)
+        self.assertEqual(row.spikes_removed, 0)
+
+    def test_cleaning_toggle_disables_monthly_reduction_only(self):
+        data = self.data([0., 0., 10.] * 3 + [0., 0., 1000.])
+        cleaned = self.calculate(data)
+        original = self.calculate(data, clean_spikes=False)
+        clean_row, raw_row = cleaned["orders"].iloc[0], original["orders"].iloc[0]
+        self.assertEqual(raw_row.demand_pattern, clean_row.demand_pattern)
+        self.assertEqual(raw_row.model_label, clean_row.model_label)
+        self.assertEqual(raw_row.spikes_removed, 0)
+        self.assertEqual(original["history"].iloc[-1].clean_qty, 1000)
+        self.assertGreater(raw_row.forecast_qty, clean_row.forecast_qty)
+        self.assertEqual(raw_row.growth_rate, clean_row.growth_rate)
+        self.assertEqual(raw_row.season_factor, clean_row.season_factor)
+
+    def test_cleaning_toggle_disables_transaction_reductions(self):
+        data = self.data([30.] * 11 + [120.])
+        data["transactions"] = pd.DataFrame([dict(supplier="S", sku="A", date=d, qty=q) for d, q in zip(pd.date_range("2026-08-01", periods=10), [3.] * 9 + [93.])])
+        result = self.calculate(data, clean_spikes=False)
+        self.assertEqual(result["history"].iloc[-1].clean_qty, 120)
+        self.assertFalse(result["history"].transaction_spike.any())
+        self.assertEqual(result["summary"]["spikes_removed"], 0)
+
     def test_seasonal_peak_is_not_a_spike(self):
         data = self.data([30.] * 11 + [90.])
         data["seasonality"].loc[data["seasonality"].month == 8, "factor"] = 3
@@ -59,6 +116,61 @@ class ReplenishmentTests(unittest.TestCase):
         result = self.calculate(data)
         self.assertIn("Входящий остаток", result["orders"].iloc[0].reason)
         self.assertTrue(any("начало месяца" in warning for warning in result["warnings"]))
+        self.assertTrue(result["orders"].iloc[0].manual_review)
+        self.assertTrue(pd.isna(result["orders"].iloc[0].order_qty))
+
+    def test_unknown_inventory_basis_requires_confirmation(self):
+        for basis in ("unknown", None):
+            with self.subTest(basis=basis):
+                data = self.data()
+                data["stock"]["stock_basis"] = basis
+                row = self.row(data)
+                self.assertTrue(row.manual_review)
+                self.assertTrue(pd.isna(row.order_qty))
+                self.assertEqual(row.potential_order_qty, 73)
+
+    def test_transit_cannot_hide_shortage_before_late_arrival(self):
+        data = self.data()
+        data["transit"] = pd.DataFrame([dict(supplier="S", sku="A", qty=100, eta=pd.Timestamp("2026-11-30"))])
+        row = self.row(data)
+        self.assertGreater(row.in_transit, row.forecast_qty)
+        self.assertEqual(row.potential_order_qty, 0)
+        self.assertGreater(row.arrival_gap_qty, 0)
+        self.assertEqual(row.arrival_gap_date, pd.Timestamp("2026-09-23"))
+        self.assertTrue(row.manual_review)
+        self.assertTrue(pd.isna(row.order_qty))
+        self.assertEqual(row.urgency, "Проверить данные")
+
+    def test_transit_on_calculation_date_has_no_arrival_gap(self):
+        data = self.data()
+        data["transit"] = pd.DataFrame([dict(supplier="S", sku="A", qty=100, eta=pd.Timestamp("2026-09-23"))])
+        row = self.row(data)
+        self.assertEqual(row.arrival_gap_qty, 0)
+        self.assertFalse(row.manual_review)
+        self.assertEqual(row.order_qty, 0)
+
+    def test_stock_covers_wait_for_early_transit(self):
+        data = self.data()
+        data["stock"].loc[0, "stock"] = 20
+        data["transit"] = pd.DataFrame([dict(supplier="S", sku="A", qty=100, eta=pd.Timestamp("2026-10-01"))])
+        row = self.row(data)
+        self.assertEqual(row.arrival_gap_qty, 0)
+        self.assertFalse(row.manual_review)
+        self.assertEqual(row.order_qty, 0)
+
+    def test_late_partial_transit_gap_considers_proposed_order(self):
+        data = self.data()
+        data["transit"] = pd.DataFrame([dict(supplier="S", sku="A", qty=20, eta=pd.Timestamp("2026-11-30"))])
+        row = self.row(data)
+        self.assertEqual(row.potential_order_qty, 53)
+        self.assertGreater(row.arrival_gap_qty, 0)
+        self.assertTrue(row.manual_review)
+
+    def test_ordinary_replenishment_without_transit_remains_automatic(self):
+        row = self.row()
+        self.assertEqual(row.arrival_gap_qty, 0)
+        self.assertFalse(row.manual_review)
+        self.assertEqual(row.order_qty, 73)
 
     def test_stockout_correction_is_bounded_and_disclosed(self):
         data = self.data([30.] * 10 + [0., 0.])

@@ -15,6 +15,7 @@ def load_demo_data() -> dict:
         ('Systeme Electric', 'DEMO-102', 'Розетка с заземлением', 'Электроустановка', 340, 170, 100, 20, 'steady'),
         ('Systeme Electric', 'DEMO-103', 'Выключатель одноклавишный', 'Электроустановка', 230, 100, 50, 10, 'spike'),
         ('Systeme Electric', 'DEMO-104', 'Датчик движения', 'Освещение', 55, 15, 10, 5, 'seasonal'),
+        ('ИЭК', 'DEMO-005', 'Запасной модуль промышленного реле', 'Редкий спрос', 10, 1, 1, 1, 'intermittent'),
     ]
     factors = [0.74, 0.77, 0.89, 0.98, 1.04, 1.08, 0.96, 1.02, 1.21, 1.25, 1.13, 0.93]
     mean = sum(factors)/12
@@ -25,6 +26,8 @@ def load_demo_data() -> dict:
             trend = 1 + (0.012*i if mode == 'growth' else 0.002*i)
             qty = round(base * factors[month.month-1] * trend * (1 + 0.05*math.sin(i*1.7+index)))
             available = round(base*2)
+            if mode == 'intermittent':
+                qty = 10 if month.month % 3 == 0 else 0
             if mode == 'spike' and month == pd.Timestamp('2026-06-01'):
                 qty += base*16
             if mode == 'stockout' and month in pd.to_datetime(['2026-04-01','2026-05-01','2026-07-01']):
@@ -42,7 +45,7 @@ def load_demo_data() -> dict:
         growth.append([supplier,'Все',0.06])
     return {
         'sales': pd.DataFrame(sales,columns=['supplier','sku','name','category','month','qty']),
-        'stock': pd.DataFrame(stock,columns=['supplier','sku','month','stock']),
+        'stock': pd.DataFrame(stock,columns=['supplier','sku','month','stock']).assign(stock_basis='snapshot'),
         'moq': pd.DataFrame(moq,columns=['supplier','sku','moq','pack_size']),
         'transit': pd.DataFrame(transit,columns=['supplier','sku','qty','eta']),
         'seasonality': pd.DataFrame(seasons,columns=['supplier','category','month','factor']),

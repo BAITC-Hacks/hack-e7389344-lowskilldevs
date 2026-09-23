@@ -16,7 +16,8 @@ ORDER_COLUMNS = [
     "stock", "in_transit", "moq", "pack_size", "order_qty", "urgency", "reason",
     "spikes_removed", "lost_demand", "season_factor", "growth_rate", "manual_review",
     "unknown_transit", "lead_demand", "stock_month", "potential_order_qty",
-    "spike_units_removed", "demand_months",
+    "spike_units_removed", "demand_months", "demand_pattern", "model_label",
+    "arrival_gap_qty", "arrival_gap_date",
 ]
 HISTORY_COLUMNS = [
     "supplier", "sku", "month", "qty", "clean_qty", "adjusted_qty", "season_factor",
@@ -54,6 +55,39 @@ def _outliers(values: np.ndarray) -> np.ndarray:
     center = float(np.median(values))
     deviation = float(np.median(np.abs(values - center))) * 1.4826
     return values > max(center + 3.5 * deviation, center * 2.5, center + 3)
+
+
+def _demand_pattern(values: np.ndarray) -> str:
+    """Classify observed incidence; absent months are never invented as zeros."""
+    positive_count = int(np.count_nonzero(values > 0))
+    if len(values) < 4:
+        return "insufficient"
+    if positive_count == 0:
+        return "no_demand"
+    if positive_count == 1:
+        return "insufficient"
+    return "intermittent" if positive_count / len(values) <= .6 else "regular"
+
+
+def _monthly_outliers(values: np.ndarray, pattern: str) -> tuple[np.ndarray, float]:
+    """Sparse incidence is not an anomaly: compare positive event sizes only.
+
+    Three or more positive months are required for a magnitude comparison. One
+    event alone cannot establish whether a sale was exceptional, so it is kept
+    in the audit history and referred to a manager instead of being erased.
+    """
+    flags = np.zeros(len(values), dtype=bool)
+    if pattern in ("intermittent", "insufficient"):
+        positive = values[values > 0]
+        if len(positive) >= 3:
+            center = float(np.median(positive))
+            scale = float(np.median(np.abs(positive - center))) * 1.4826
+            flags = values > max(center + 3.5 * scale, 4 * center, center + 3)
+        remaining = values[(values > 0) & ~flags]
+    else:
+        flags = _outliers(values)
+        remaining = values[~flags]
+    return flags, float(np.median(remaining)) if len(remaining) else 0.
 
 
 def _round_order(need: float, moq: int, pack: int) -> int:
@@ -114,6 +148,7 @@ def calculate_orders(
     growth_pct: float = 0,
     as_of: Any = None,
     category_filter: Any = None,
+    clean_spikes: bool = True,
 ) -> dict[str, Any]:
     """Return orders/history DataFrames, warnings and summary.
 
@@ -121,6 +156,8 @@ def calculate_orders(
     with invented zeros. Forecast integrates calendar days, seasonality and a
     bounded robust annual trend. Missing/stale stock or uncertain arrivals make
     order_qty NaN; potential_order_qty is only an indicative manager estimate.
+    clean_spikes=False disables both transaction and monthly spike reductions;
+    seasonality, stockout correction, model selection and growth stay unchanged.
     """
     durations = [lead_time_days, review_days, safety_days]
     if any(not math.isfinite(float(v)) or float(v) < 0 or int(v) != float(v) for v in durations):
@@ -161,7 +198,7 @@ def calculate_orders(
     transactions["qty"] = _numeric(transactions.qty, 0).clip(lower=0)
     transactions = transactions[transactions.date < current_month].copy()
     transactions["month"] = transactions.date.dt.to_period("M").dt.to_timestamp()
-    transaction_reductions, client_keys = _transaction_reductions(transactions)
+    transaction_reductions, client_keys = _transaction_reductions(transactions) if clean_spikes else ({}, set())
     seasons["month"] = _numeric(seasons.month)
     seasons["factor"] = _numeric(seasons.factor)
     seasons = seasons[(seasons.month >= 1) & (seasons.month <= 12) & (seasons.factor > 0)].copy()
@@ -203,9 +240,11 @@ def calculate_orders(
         stock_date = inventory.iloc[-1].month if not inventory.empty else pd.NaT
         stock_basis = str(inventory.iloc[-1].get("stock_basis", "unknown")) if not inventory.empty else "unknown"
         if stock_basis == "opening":
-            reasons.append("Входящий остаток на начало месяца: движения после снимка не учтены")
-        elif stock_basis == "unknown" and pd.notna(stock_date):
-            reasons.append("Месячный остаток: точный момент снимка не подтверждён")
+            reasons.append("Входящий остаток на начало месяца: движения после снимка не учтены; подтвердите фактический остаток")
+            review = True
+        elif stock_basis != "snapshot" and pd.notna(stock_date):
+            reasons.append("Месячный остаток: точный момент снимка не подтверждён; подтвердите фактический остаток")
+            review = True
         if pd.isna(stock_value):
             reasons.append("Нет подтверждённого остатка: количество требует проверки")
             review = True
@@ -223,13 +262,17 @@ def calculate_orders(
             reasons.append("Нет завершённых месяцев продаж для оценки спроса")
             monthly_demand, local_growth = 0., 0.
             spikes_removed, spike_units, lost_total = 0, 0., 0.
+            pattern = "insufficient"
+            model_label = "Недостаточно истории для прогноза"
         else:
             monthly["season_factor"] = monthly.month.dt.month.map(factors)
+            # Choose the model on the same observed incidence in both toggle
+            # modes so before/after compares cleaning, not different model rules.
+            pattern = _demand_pattern(monthly.qty.to_numpy(dtype=float))
             monthly["event_reduction"] = [min(float(qty), transaction_reductions.get((*key, month), 0)) for month, qty in zip(monthly.month, monthly.qty)]
             monthly["clean_qty"] = (monthly.qty - monthly.event_reduction).clip(lower=0)
             deseason = (monthly.clean_qty / monthly.season_factor).to_numpy(dtype=float)
-            flags = _outliers(deseason)
-            replacement = float(np.median(deseason[~flags])) if (~flags).any() else 0
+            flags, replacement = _monthly_outliers(deseason, pattern) if clean_spikes else (np.zeros(len(deseason), dtype=bool), 0.)
             monthly.loc[flags, "clean_qty"] = replacement * monthly.loc[flags, "season_factor"]
             monthly["spike"] = flags | (monthly.event_reduction > 0).to_numpy()
             monthly["client_spike"] = [(*key, month) in client_keys for month in monthly.month]
@@ -246,14 +289,30 @@ def calculate_orders(
             recent = monthly.tail(12)
             levels = (recent.adjusted_qty / recent.season_factor).to_numpy(dtype=float)
             times = (recent.month.dt.year * 12 + recent.month.dt.month).to_numpy(dtype=float)
-            slopes = []
-            if len(recent) >= 6:
-                slopes = [(levels[j] - levels[i]) / (times[j] - times[i]) for i in range(len(times)) for j in range(i + 1, len(times))]
-            slope = float(np.median(slopes)) if slopes else 0.
-            raw_level = float(np.median(levels[-6:]))
-            local_growth = float(np.clip(12 * slope / max(raw_level, 1), -.5, .5))
-            bounded_slope = local_growth * raw_level / 12
-            monthly_demand = max(0., float(np.median(levels[-6:] + bounded_slope * (times[-1] - times[-6:]))))
+            if pattern == "regular":
+                slopes = []
+                if len(recent) >= 6:
+                    slopes = [(levels[j] - levels[i]) / (times[j] - times[i]) for i in range(len(times)) for j in range(i + 1, len(times))]
+                slope = float(np.median(slopes)) if slopes else 0.
+                raw_level = float(np.median(levels[-6:]))
+                local_growth = float(np.clip(12 * slope / max(raw_level, 1), -.5, .5))
+                bounded_slope = local_growth * raw_level / 12
+                monthly_demand = max(0., float(np.median(levels[-6:] + bounded_slope * (times[-1] - times[-6:]))))
+                model_label = "Робастный уровень и тренд"
+            else:
+                # Expected units/month = average positive size × observed event
+                # frequency. Unlike the median, this preserves recurring rare
+                # demand. No SKU trend is extrapolated from sparse occurrences.
+                monthly_demand = max(0., float(np.mean(levels)))
+                local_growth = 0.
+                model_label = {"intermittent": "Средняя частота за 12 месяцев", "insufficient": "Предварительная средняя · мало наблюдений", "no_demand": "Нулевой наблюдаемый спрос"}[pattern]
+                if pattern == "intermittent":
+                    reasons.append(f"Прерывистый спрос: {int((recent.qty > 0).sum())} ненулевых из {len(recent)} месяцев; средняя частота сохраняет регулярные редкие покупки")
+                elif pattern == "insufficient" and int((monthly.qty > 0).sum()) == 1:
+                    reasons.append("Только одна положительная продажа: регулярность не подтверждена; средняя предварительная, требуется классификация менеджером")
+                    review = True
+                elif pattern == "no_demand":
+                    reasons.append("В наблюдаемой истории продаж нет; это не доказывает отсутствие потенциального спроса")
             spikes_removed = int(monthly.spike.sum())
             spike_units = float((monthly.qty - monthly.clean_qty).sum())
             lost_total = float(monthly.lost_demand.sum())
@@ -294,6 +353,33 @@ def calculate_orders(
         if moq_row is None:
             reasons.append("MOQ/кратность не заданы: принято 1, подтвердите у поставщика")
         potential = _round_order(forecast - stock_value - in_transit, moq, pack) if pd.notna(stock_value) else np.nan
+        # A positive balance at the horizon must not hide a shortage while
+        # waiting for existing transit. Include the proposed new order at its
+        # configured lead time. When that new order is positive, its ordinary
+        # pre-lead shortage is already represented by urgency, not a new block.
+        arrival_gap_qty, arrival_gap_date = 0., pd.NaT
+        future_due = due[(due.eta.dt.normalize() > today) & (due.qty > 0)]
+        if pd.notna(stock_value) and stock_value >= 0 and not future_due.empty:
+            receipts = np.zeros(horizon, dtype=float)
+            for delivery in due.itertuples():
+                arrival_day = max(0, int((delivery.eta.normalize() - today).days))
+                if arrival_day < horizon:
+                    receipts[arrival_day] += delivery.qty
+            if potential > 0 and lead_time_days < horizon:
+                receipts[lead_time_days] += potential
+            balances = stock_value + np.cumsum(receipts) - np.cumsum(daily_forecast)
+            start_day = lead_time_days if potential > 0 else 0
+            last_arrival_day = int((future_due.eta.max().normalize() - today).days)
+            before_arrival = balances[start_day:last_arrival_day]
+            shortage_days = np.flatnonzero(before_arrival < -1e-8)
+            if len(shortage_days):
+                arrival_gap_qty = float(-before_arrival.min())
+                arrival_gap_date = today + pd.Timedelta(days=start_day + int(shortage_days[0]))
+                reasons.append(
+                    f"До поступления товара в пути возможен дефицит до {_quantity_label(arrival_gap_qty)} ед. "
+                    f"с {arrival_gap_date:%d.%m.%Y}; проверьте сроки и объём поступлений"
+                )
+                review = True
         order_qty = np.nan if review else potential
         urgency = "Проверить данные" if review else ("Срочно" if potential > 0 and stock_value < lead_demand else "Планово" if potential > 0 else "Запас достаточен")
         demand_known = not monthly.empty
@@ -318,7 +404,8 @@ def calculate_orders(
                          reason="; ".join(reasons), spikes_removed=spikes_removed, lost_demand=round(lost_total, 3),
                          season_factor=round(season_factor, 4), growth_rate=round(final_growth, 4),
                          manual_review=review, unknown_transit=unknown, lead_demand=round(lead_demand, 3), stock_month=stock_date,
-                         potential_order_qty=potential, spike_units_removed=round(spike_units, 3), demand_months=len(monthly)))
+                         potential_order_qty=potential, spike_units_removed=round(spike_units, 3), demand_months=len(monthly), demand_pattern=pattern, model_label=model_label,
+                         arrival_gap_qty=round(arrival_gap_qty, 3), arrival_gap_date=arrival_gap_date))
     orders = pd.DataFrame(rows, columns=ORDER_COLUMNS)
     history_frame = pd.DataFrame(history, columns=HISTORY_COLUMNS)
     if len(history_frame) and history_frame.stockout_proxy.any():
@@ -327,8 +414,14 @@ def calculate_orders(
         warnings.append("Для части категорий нет сезонности: для отсутствующих месяцев принят коэффициент 1.")
     if transaction_reductions:
         warnings.append("Всплески оценены по покупкам клиентов (от 4 месяцев) либо продажам SKU за день (от 8 дней, более 5× медианы); проверьте их разовый характер.")
+    if not clean_spikes:
+        warnings.append("Сглаживание всплесков отключено для сравнения; сезонность, поправка на возможный дефицит и правила роста сохранены.")
+    if len(orders) and orders.demand_pattern.eq("intermittent").any():
+        warnings.append("Для прерывистого спроса используется средняя частота по наблюдаемым месяцам: нули сохраняются, большие продажи сравниваются с положительными месяцами.")
     if len(orders) and orders.manual_review.any():
         warnings.append("Строки «Проверить данные» не имеют автоматического заказа; предварительная оценка вынесена в отдельную колонку.")
+    if len(orders) and orders.arrival_gap_qty.gt(0).any():
+        warnings.append("Суммарный товар в пути может не покрыть спрос до даты прихода. Проверка по дням учитывает известные приходы и предполагает поступление нового заказа через заданный срок поставки; выявленные разрывы требуют решения менеджера.")
     if not stock.empty:
         bases = set(stock.stock_basis.dropna().astype(str)) if "stock_basis" in stock else {"unknown"}
         if "opening" in bases:
