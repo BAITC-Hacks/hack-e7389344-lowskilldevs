@@ -4,8 +4,6 @@
 
 **Hackathon team repository:** `hack-e7389344-lowskilldevs` · **Track/Topic:** Logistics.
 
-Warehouse replenishment is currently calculated manually in Excel. LogiPilot combines sales, stock and incoming deliveries into explainable supplier recommendations. A procurement manager reviews selected positions before export. The implementation below distinguishes working features, measured validation results and future pilot work.
-
 Менеджер закупок загружает отчёты ИЭК и Systeme Electric, получает предложения по пополнению склада с объяснением по каждому артикулу, корректирует количества и утверждает выгрузку. Приложение учитывает сезонность, динамику продаж, остатки, товары в пути, минимальную партию и кратность. Разовые всплески обрабатываются отдельно от регулярного спроса.
 
 Рабочий MVP на Python и Streamlit: воспроизводимый расчёт, проверка на истории, согласование выбранных позиций и AI-помощник с инструментами сценарного анализа. Основные функции работают без API-ключа. OpenAI подключается отдельно; модели передаются вопрос, названия поставщиков и агрегированные результаты инструментов, без построчных продаж и исходных Excel.
